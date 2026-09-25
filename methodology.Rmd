@@ -1,0 +1,279 @@
+---
+title: "Predicting 2025 Strikeout Rate"
+subtitle: "Phillies Quantitative Analyst Associate (2027) Trial Project: Methodology"
+author: "Henry Bednar"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+geometry: margin=1in
+fontsize: 11pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{array}
+  - \setlength{\parindent}{0pt}
+  - \setlength{\parskip}{6pt}
+---
+
+```{r setup, include = FALSE}
+# Step 3 of 3: knit (via render_methodology.R) after running data_merge.R
+# and k_percentage_model.R. Every number below is computed from their output files.
+# Developed with assistance from Claude (Anthropic), https://claude.ai
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.path = "figs/", fig.align = "center", fig.pos = "H", dev = "pdf")
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+options(kableExtra.latex.load_packages = FALSE)  # only booktabs/float/array needed (loaded above)
+library(kableExtra)
+
+s     <- readRDS("k_2026_model_summary.rds")
+preds <- read_csv("k_2026_2025_predictions.csv", show_col_types = FALSE)
+feats <- read_csv("k_2026_features.csv", show_col_types = FALSE, guess_max = 10000)
+f25 <- feats %>% filter(Season == 2025) %>% select(PlayerId, league_k_trailing, trail_K_weighted)
+p <- preds %>% left_join(f25, by = "PlayerId")
+decisions <- read_csv("experiments/design_decisions.csv", show_col_types = FALSE)
+
+wrmse <- function(pred, y, w) sqrt(weighted.mean((pred - y)^2, w))
+wmae  <- function(pred, y, w) weighted.mean(abs(pred - y), w)
+wr2   <- function(pred, y, w) 1 - sum(w * (y - pred)^2) / sum(w * (y - weighted.mean(y, w))^2)
+logloss <- function(q, y, w) { q <- pmin(pmax(q, 1e-6), 1 - 1e-6); -weighted.mean(y * log(q) + (1 - y) * log(1 - q), w) }
+pct   <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+num   <- function(x, d = 3) formatC(x, format = "f", digits = d)
+
+group_labels <- c(
+  A_full_model           = "Established pitchers",
+  B1_no_history_milb     = "Newcomers with minor-league data",
+  B2_no_history_fallback = "Newcomers without minor-league data",
+  C_position_player      = "Position players"
+)
+p$group <- factor(group_labels[p$bucket], levels = group_labels)
+p$pred_league <- p$league_k_trailing
+p$pred_trail  <- coalesce(p$trail_K_weighted, p$league_k_trailing)
+covered <- with(p, K_pct >= pred_lower & K_pct <= pred_upper)
+
+overall <- tibble(
+  Method = c("League average K\\% from 2024 (naive)",
+             "Pitcher's own recent K\\%, league average if none (naive)",
+             "Final model"),
+  pred = list(p$pred_league, p$pred_trail, p$pred_final)
+) %>%
+  rowwise() %>%
+  mutate(RMSE = wrmse(pred, p$K_pct, p$TBF), MAE = wmae(pred, p$K_pct, p$TBF),
+         R2 = wr2(pred, p$K_pct, p$TBF), LogLoss = logloss(pred, p$K_pct, p$TBF)) %>%
+  ungroup() %>%
+  select(-pred)
+final <- overall[3, ]
+
+by_group <- p %>%
+  group_by(group) %>%
+  summarise(Players = n(), `Median TBF` = median(TBF),
+            RMSE = wrmse(pred_final, K_pct, TBF), MAE = wmae(pred_final, K_pct, TBF),
+            `80% interval coverage` = mean(K_pct >= pred_lower & K_pct <= pred_upper),
+            raw_RMSE = wrmse(pred_final_raw, K_pct, TBF), .groups = "drop")
+n_group <- setNames(by_group$Players, as.character(by_group$group))
+tbf_share_A <- sum(p$TBF[p$bucket == "A_full_model"]) / sum(p$TBF)
+
+infl <- s$tree_influence
+infl_of <- function(v) { x <- infl$rel.inf[infl$var == v]; if (length(x)) x else 0 }
+calib <- s$calib_table
+cal_of <- function(b) calib$calib_ratio[calib$bucket == b]
+sd_of  <- function(b) calib$model_error_sd[calib$bucket == b]
+bt <- s$backtest_metrics
+bt_rmse <- function(m) bt$RMSE[bt$model == m]
+
+# 80% interval half-width for an established pitcher at a typical 22% K rate
+halfwidth <- function(tbf, prob = 0.22) qnorm(0.9) * sqrt(sd_of("A_full_model")^2 + prob * (1 - prob) / tbf)
+
+# League environment: forecast level vs. what 2025 delivered
+league_2024 <- feats %>% filter(Season == 2024) %>% summarise(k = weighted.mean(K_pct, TBF)) %>% pull(k)
+league_2025 <- weighted.mean(p$K_pct, p$TBF)
+pred_level  <- weighted.mean(p$pred_final, p$TBF)
+level_share <- (pred_level - league_2025)^2 / final$RMSE^2
+
+# Reliability by decile of prediction
+rel <- p %>% mutate(decile = ntile(pred_final, 10)) %>% group_by(decile) %>%
+  summarise(batters = sum(TBF), predicted = weighted.mean(pred_final, TBF),
+            observed = sum(K_pct * TBF) / sum(TBF), .groups = "drop")
+cal_slope <- unname(coef(lm(observed ~ predicted, data = rel, weights = batters))[2])
+
+pp <- by_group %>% filter(group == "Position players")
+pp_k_per_season <- calib$actual_K[calib$bucket == "C_position_player"] / 3  # 2022-2024 backtest
+milb_bt <- s$milb_backtest
+milb_edge <- milb_bt["league_rmse"] - milb_bt["milb_rmse"]
+milb_verdict <- if (milb_edge > 0.0005) paste0("a small edge from a single season of ", milb_bt["n"], " pitchers") else "effectively a tie"
+milb_short <- if (milb_edge > 0.0005) "only narrowly beats the league average, on a single backtest season" else "only ties the league average in backtest"
+
+arsenal_names <- c(fastball_avg_speed_lag1 = "fastball velocity", ff_avg_speed_lag1 = "four-seam velocity",
+                   ff_avg_spin_lag1 = "four-seam spin", si_avg_speed_lag1 = "sinker velocity",
+                   si_avg_spin_lag1 = "sinker spin", sl_avg_speed_lag1 = "slider velocity",
+                   sl_avg_spin_lag1 = "slider spin", ch_avg_speed_lag1 = "changeup velocity",
+                   ch_avg_spin_lag1 = "changeup spin", cu_avg_speed_lag1 = "curveball velocity",
+                   cu_avg_spin_lag1 = "curveball spin", fc_avg_speed_lag1 = "cutter velocity",
+                   fc_avg_spin_lag1 = "cutter spin")
+top_arsenal <- infl %>% filter(var %in% names(arsenal_names)) %>% slice_max(rel.inf, n = 1)
+n_off_chart <- sum(p$K_pct > 0.5)
+```
+
+# Summary
+
+I predicted 2025 strikeout rate (K%) for all `r nrow(p)` pitchers in `k_2026.csv`. Weighted by batters faced (TBF), the predictions have an RMSE of `r num(final$RMSE, 4)` and an MAE of `r num(final$MAE, 4)`, so a typical miss is about `r num(100 * final$MAE, 1)` K% points, and they explain `r pct(final$R2, 0)` of the pitcher-to-pitcher variation in 2025 K% ($R^2$). For comparison, the 2024 league average explains none of that variation and each pitcher's own recent K% explains `r pct(overall$R2[2], 0)` (Table 1).
+
+Each prediction also comes with an 80% interval, and `r pct(mean(covered), 0)` of actual 2025 values landed inside theirs, at every workload level. For an established pitcher striking out 22% of batters, the interval runs about `r num(100 * halfwidth(600), 1)` points either side of the prediction over 600 TBF and about `r num(100 * halfwidth(60), 1)` points either side over 60 TBF.
+
+What drove the predictions was mostly a pitcher being himself: his own strikeout history, stabilized so a small sample isn't taken at face value, followed by last season's Stuff+, whiff rates, and velocity. A large share of the error that remains is sampling noise that no model can remove (Figure 2), and none of the variants I tested, whether new features, different model types, or different shrinkage, moved the backtest RMSE by more than 0.0003 (Table 4). Further accuracy would have to come from information this data doesn't contain.
+
+```{r tab-overall}
+overall %>%
+  mutate(RMSE = num(RMSE, 4), MAE = num(MAE, 4), R2 = sub("^-0\\.00$", "0.00", num(R2, 2)),
+         LogLoss = num(LogLoss, 4)) %>%
+  rename(`$R^2$` = R2, `Log-loss` = LogLoss) %>%
+  kable(format = "latex", booktabs = TRUE, escape = FALSE, align = "lrrrr",
+        caption = "2025 accuracy, all players, weighted by TBF. Log-loss is per batter faced; lower RMSE/MAE/log-loss and higher $R^2$ are better.") %>%
+  kable_styling(latex_options = "HOLD_position") %>%
+  row_spec(3, bold = TRUE)
+```
+
+# Results
+
+```{r tab-groups-results}
+by_group %>%
+  transmute(Group = group, Players, `Median TBF` = as.integer(`Median TBF`),
+            RMSE = num(RMSE, 4), MAE = num(MAE, 4),
+            `80% interval coverage` = pct(`80% interval coverage`, 0)) %>%
+  kable(format = "latex", booktabs = TRUE, align = "lrrrrr",
+        caption = "2025 accuracy by pitcher group (TBF-weighted).") %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+Established pitchers, who faced `r pct(tbf_share_A, 0)` of all batters, were predicted most accurately, and newcomers without a minor-league record were the hardest group because the least is known about them. `r if (pp$RMSE > pp$raw_RMSE) paste0("For position players, the calibration I fixed from 2022-2024 raised the 2025 RMSE (", num(pp$raw_RMSE, 4), " before, ", num(pp$RMSE, 4), " after), because 2025 position players struck out more often than recent ones. I kept it anyway, since the rule was set on earlier seasons and changing it after seeing 2025 would stop 2025 from being a true out-of-sample test.") else paste0("For position players, the calibration I fixed from 2022-2024 lowered the 2025 RMSE from ", num(pp$raw_RMSE, 4), " to ", num(pp$RMSE, 4), ".")`
+
+Grouped into deciles by prediction, observed 2025 K% tracks predicted K% with a slope of `r num(cal_slope, 2)`, where 1.00 would mean the predictions spread out exactly as much as reality did. The one systematic error came from the league as a whole. League K% fell from `r pct(league_2024)` in 2024 to `r pct(league_2025)` in 2025 while the forecasts averaged `r pct(pred_level)`, and nothing available before Opening Day pointed to a league-wide drop. That gap accounts for only `r pct(level_share, 0)` of the squared error, but it does mean part of any individual pitcher's 2025 miss reflects the league environment and not his own skill.
+
+```{r fig-scatter, fig.width = 6.2, fig.height = 3.4, fig.cap = paste0("Predicted vs. actual 2025 K%. Point area is proportional to TBF; the line is a perfect prediction. Small-TBF points scatter widely because of sampling noise. The vertical column near 1% is position players.", if (n_off_chart > 0) paste0(" ", n_off_chart, " players with actual K% above 50% (all with very few batters faced) are above the plotted range.") else "")}
+ggplot(p, aes(pred_final, K_pct, size = TBF)) +
+  geom_abline(slope = 1, intercept = 0, colour = "#52514e", linewidth = 0.4) +
+  geom_point(colour = "#2a78d6", alpha = 0.35, stroke = 0) +
+  scale_size_area(max_size = 3.5, guide = "none") +
+  scale_x_continuous("Predicted 2025 K%", labels = function(x) paste0(100 * x, "%")) +
+  scale_y_continuous("Actual 2025 K%", labels = function(x) paste0(100 * x, "%")) +
+  coord_cartesian(ylim = c(0, 0.5)) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major = element_line(colour = "#e6e5e0"),
+        axis.title = element_text(colour = "#52514e"))
+```
+
+```{r fig-noise, fig.width = 6.2, fig.height = 2.8, fig.cap = "2025 prediction error by workload (TBF-weighted RMSE). The grey point is the error a perfect estimate of true talent would still make from sampling noise alone; the gap to the blue point is what a model can still improve."}
+bands <- p %>%
+  mutate(band = cut(TBF, c(0, 25, 100, 300, Inf),
+                    labels = c("1-25 TBF", "26-100 TBF", "101-300 TBF", "300+ TBF"))) %>%
+  group_by(band) %>%
+  summarise(Achieved = wrmse(pred_final, K_pct, TBF),
+            `Noise floor` = sqrt(weighted.mean(pred_final * (1 - pred_final) / TBF, TBF)), .groups = "drop")
+bl <- tidyr::pivot_longer(bands, c(Achieved, `Noise floor`), names_to = "what", values_to = "rmse")
+ggplot(bands, aes(y = band)) +
+  geom_segment(aes(x = `Noise floor`, xend = Achieved, yend = band), colour = "#c3c2b7", linewidth = 2) +
+  geom_point(data = bl, aes(x = rmse, colour = what), size = 3) +
+  geom_text(data = bl %>% filter(band == "300+ TBF"),
+            aes(x = rmse, label = what, colour = what), vjust = 2.2, size = 3, show.legend = FALSE) +
+  scale_colour_manual(NULL, values = c(Achieved = "#2a78d6", `Noise floor` = "#8a8983")) +
+  scale_x_continuous("RMSE (K% points)", labels = function(x) paste0(100 * x), limits = c(0, NA)) +
+  scale_y_discrete(NULL, limits = rev) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(), panel.grid.major.x = element_line(colour = "#e6e5e0"))
+```
+
+# Method
+
+## Four pitcher groups, one routing rule
+
+A veteran starter, a debuting rookie, and an infielder mopping up a blowout need different treatment, so I routed each player to one of four groups (Table 3). The routing uses only seasons before the one being predicted, which means each group holds the same kind of player in 2022, 2023, 2024, and 2025, and each group's backtest measures the kind of player it is later applied to.
+
+```{r tab-groups}
+tibble(
+  Group = group_labels,
+  `Who` = c("Pitched in an earlier season of k\\_2026.csv",
+            "No earlier k\\_2026.csv season; has a prior MiLB season",
+            "No earlier k\\_2026.csv season or MiLB record",
+            "Has an MLB hitting season ($\\geq$25 PA) and no MLB pitching record"),
+  `Prediction rule` = c("Blend of three models (below)",
+                        "Elastic net on prior MiLB stats",
+                        "Prior season's league-average K\\%",
+                        "Prior season's position-player K\\%"),
+  `2025 players` = as.integer(n_group[group_labels])
+) %>%
+  kable(format = "latex", booktabs = TRUE, escape = FALSE,
+        caption = "Pitcher groups. The first matching rule wins, in order: position player, established, newcomer.") %>%
+  kable_styling(latex_options = c("HOLD_position", "scale_down")) %>%
+  column_spec(2, width = "5.2cm") %>% column_spec(3, width = "4cm")
+```
+
+## Established pitchers: three models, blended
+
+Every input for these pitchers comes from before the season being predicted: K% from the prior one and two seasons, a TBF-weighted K% over the last three seasons pitched, last season's Stuff+, whiff%, zone-swing-miss%, chase rate, walk rate, and CSW%, fastball velocity, velocity and spin for six pitch types, role (share of appearances as a starter), age, career TBF, and the prior season's league K%.
+
+I combined three models, each good at something different. Empirical Bayes shrinkage pulls a pitcher's recent K% toward the league average, $\hat p = (K + k\,m)/(\text{TBF} + k)$ over the last three seasons, where $m$ is the prior season's league K% and $k$ = `r s$eb_k` TBF is fit on the training seasons. That is the beta-binomial posterior mean [1], so a pitcher's own rate earns weight only as fast as his batters faced accumulate. The fitted $k$ is larger than the roughly 70 batters faced at which K% stabilizes within a season [2], as it should be: a forecast of next season has to absorb real changes in talent from one year to the next as well as sampling noise. A binomial elastic net [3], a penalized logistic regression on strikeout counts, uses every input above. XGBoost with a logistic objective [4] adds boosted trees that pick up non-linear effects and interactions, including any between age and Stuff+.
+
+None of the models' settings are hand-picked. Inside every training window, 5-fold cross-validation on binomial log-loss chooses the elastic net's balance between L1 and L2 penalties ($\alpha$ = `r s$glmnet_alpha` in the final fit) and its penalty strength, plus XGBoost's tree depth (`r s$xgb_params$max_depth`), its minimum leaf size (`r s$xgb_params$min_child_weight` TBF), and its number of trees (`r s$xgb_rounds`). The folds keep all of a pitcher's seasons together [6], so the tuning never scores a pitcher the model has already seen, and none of it touches the backtest seasons. The learning rate (`r s$xgb_params$eta`) and subsampling rates stay at conventional values, since early stopping compensates for them.
+
+Before the elastic net and XGBoost see them, the K% inputs are shrunk the same way as in the first model, so a 3-for-3 cameo enters as roughly league average instead of 100%. All three models maximize the binomial likelihood of the strikeouts, which keeps every prediction strictly between 0 and 1, and the blend weights are non-negative and sum to one (EB `r num(s$blend_w["EB"], 2)`, elastic net `r num(s$blend_w["glmnet"], 2)`, XGBoost `r num(s$blend_w["xgb"], 2)`).
+
+I tested all of this with a rolling-origin backtest [5]: train on 2022 and predict 2023, then train on 2022-2023 and predict 2024, with nothing tuned on the season being predicted. Over those two seasons the blend's RMSE was `r num(s$blend_rmse, 4)`, against `r num(bt_rmse("League mean (naive)"), 4)` for the league average, `r num(bt_rmse("Trailing weighted avg (naive)"), 4)` for trailing K%, and `r num(bt_rmse("Empirical Bayes shrinkage"), 4)` for shrinkage alone. No modeling choice was made on 2025 results.
+
+## Newcomers and position players
+
+Newcomers with minor-league data get a binomial elastic net that translates their most recent prior MiLB season into an MLB K%. On its one backtest season (2024, n = `r milb_bt["n"]`) it scored an RMSE of `r num(milb_bt["milb_rmse"], 4)` against `r num(milb_bt["league_rmse"], 4)` for the league average, `r milb_verdict`, which makes it the roughest part of the model. Newcomers without MiLB data get the prior season's league average, and position players get the prior season's position-player average.
+
+## Calibration and intervals
+
+I multiply each group's predictions by that group's ratio of actual to predicted strikeouts in its 2022-2024 backtest, which is `r num(cal_of("A_full_model"), 3)` for established pitchers and `r num(cal_of("C_position_player"), 2)` for position players. It is a ratio because K% is a rate, and subtracting a fixed 2-point error from a 1% position-player rate would predict 0%.
+
+The 80% interval combines two independent sources of error: the model's own error, measured in the backtest after removing sampling noise (SD `r num(sd_of("A_full_model"), 3)` for established pitchers), and binomial sampling noise, $p(1-p)/\text{TBF}$. The second term is why the interval is wide for a 15-TBF call-up and narrow for a 600-TBF starter. The 2025 TBF sets only the interval's width for the realized sample and never enters the point prediction.
+
+# Evidence for each design choice
+
+Every choice in Table 4 was decided on the 2023-2024 backtest or by a structural test, never by its 2025 result.
+
+```{r tab-decisions}
+decisions %>%
+  transmute(Choice = decision, `Alternative tested` = alternative_tested, Evidence = evidence) %>%
+  kable(format = "latex", booktabs = TRUE, caption = "Design decisions and the evidence behind them.") %>%
+  kable_styling(latex_options = "scale_down") %>%
+  column_spec(1, width = "4.4cm") %>% column_spec(2, width = "4cm") %>% column_spec(3, width = "6.6cm")
+```
+
+## What drives the predictions
+
+In the final XGBoost model, the three-season K% carries `r num(infl_of("trail_K_weighted"), 0)`% of the total gain, last season's K% `r num(infl_of("K_pct_lag1"), 0)`%, and last season's Stuff+ `r num(infl_of("StuffPlus_lag1"), 0)`%. Whiff% and zone-swing-miss% add a real amount, and `r arsenal_names[[top_arsenal$var]]` (`r num(top_arsenal$rel.inf, 0)`%) matters more than any other single velocity or spin measure. CSW% adds only `r num(infl_of("csw_percent_lag1"), 1)`%, since it is largely redundant with whiff% and Stuff+ once those are in the model.
+
+# Safeguards
+
+The only 2025 value the model uses as an input is Age. 2025 TBF, Stuff+, and Team never enter a prediction, and 2025 K% is used only for scoring. The merge script stops if any outside file contains a season after 2024. Every feature for season $t$ comes from seasons before $t$, a lag is blanked if its source isn't exactly the season it claims to be, and group membership uses only prior seasons. Imputation medians, the shrinkage constant, and all tuning are computed from the training seasons alone and then applied unchanged to the season being predicted.
+
+The scripts stop on duplicate player-seasons (which would leak a season's K% into its own features), on missing or non-positive TBF, and on text in any numeric input column, which they report by column and value. A test script, `tests/test_pipeline.R`, injects edge cases (0-for-5, 0-for-35, 3-for-3, and 5-for-5 histories, impossible telemetry, a pitcher with no tracking data at all, missing Stuff+ or Age, a duplicated row, and a stray text value) and confirms that every prediction stays inside (0, 1), that tiny samples barely move a forecast, that bad inputs are rejected, and that the 2025 predictions are calibrated. Two consecutive runs produce identical predictions.
+
+# Limitations and next steps
+
+If I kept building on this, I'd start with the minor-league translation, which `r milb_short`. The Statcast minor-league data (apparently Triple-A only) covers just 2022-2024, and 2022 only partly, so the translation trains on a single season. Translation factors fit across more seasons and levels, with pitch-level detail, would be the first upgrade. Pre-season Steamer or ZiPS projections would be the next input to test under the same backtest-only rule, because they carry level-adjusted minor-league translations exactly where this model is weakest. I left them out so every forecast here comes from my own model, and because a 2025 file would need a verifiable date from before Opening Day.
+
+The model also can't see opponent quality or park, so a schedule heavy on high-strikeout lineups isn't reflected. Injuries show up only as lost playing time, which makes a partial season lost to injury look identical to a demotion, and a prior-season injured-list flag would capture the well-documented pattern of pitchers returning from injury. A league-wide K% shift like 2025's lands on every pitcher at once, and nothing before Opening Day predicts it. Position players who pitched combined for only about `r round(pp_k_per_season)` strikeouts a season in 2022-2024, so their group average moves a lot from year to year.
+
+# Reproducing this analysis
+
+Run `data_merge.R`, then `k_percentage_model.R`, then `render_methodology.R` to knit this document. Every number here is computed from the model's output files, and `README.md` lists the data sources, filters, and package versions. The code was developed with assistance from Claude (Anthropic), https://claude.ai, as cited in each script.
+
+# References
+
+[1] D. Robinson, "Understanding empirical Bayes estimation (using baseball statistics)," Variance Explained, 2015. http://varianceexplained.org/r/empirical_bayes_baseball/
+
+[2] FanGraphs Library, "Sample Size." https://library.fangraphs.com/principles/sample-size/
+
+[3] J. Friedman, T. Hastie, and R. Tibshirani, "Regularization Paths for Generalized Linear Models via Coordinate Descent," *Journal of Statistical Software* 33(1), 2010. https://www.jstatsoft.org/v33/i01/
+
+[4] XGBoost documentation, "XGBoost Parameters." https://xgboost.readthedocs.io/en/stable/parameter.html
+
+[5] R. J. Hyndman and G. Athanasopoulos, *Forecasting: Principles and Practice*, 3rd ed., section 5.10, "Time series cross-validation." https://otexts.com/fpp3/tscv.html
+
+[6] D. R. Roberts et al., "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure," *Ecography* 40(8), 2017. https://doi.org/10.1111/ecog.02881

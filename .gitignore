@@ -3,3 +3,13 @@
 .Rproj.user/
 *.Rproj
 data/
+
+# Input data and intermediate outputs are not published; see README.md.
+k_2026.csv
+MLBBaseballSavant*.csv
+MLBPitchersBallsStrikes*.csv
+MiLBBaseballSavant*.csv
+k_2026_final_merged.csv
+k_2026_features.csv
+k_2026_model_summary.rds
+figs/

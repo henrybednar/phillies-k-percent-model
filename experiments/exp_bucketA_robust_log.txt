@@ -1,0 +1,19 @@
+Warning messages:
+1: package 'readr' was built under R version 4.5.2 
+2: package 'glmnet' was built under R version 4.5.2 
+3: package 'xgboost' was built under R version 4.5.2 
+running honest 
+running robust 
+# A tibble: 2 × 11
+  candidate EB_rmse glmnet_rmse tree_rmse blend_pooled_rmse blend_pooled_logloss
+  <chr>       <dbl>       <dbl>     <dbl>             <dbl>                <dbl>
+1 honest     0.0412      0.0414    0.0407            0.0396                0.534
+2 robust     0.0412      0.0407    0.0407            0.0396                0.534
+  honest_2024_rmse honest_2024_logloss  w_EB w_glmnet w_tree
+             <dbl>               <dbl> <dbl>    <dbl>  <dbl>
+1           0.0397               0.532  0.45     0.25   0.3 
+2           0.0395               0.532  0.4      0.35   0.25
+
+Honest-2024 RMSE difference vs 'honest' (negative = better), 90% paired bootstrap interval:
+  robust     diff      lo5     hi95 
+      NA -0.00017 -0.00036  0.00002 

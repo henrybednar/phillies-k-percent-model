@@ -1,20 +1,41 @@
-# 12_full_model.R
+# k_percentage_model.R
 #
 # Developed with assistance from Claude (Anthropic), https://claude.ai
 #
-# Predicts each pitcher's 2025 K% from k_2026_final_merged.csv (built by
-# build_final_merge.R). Blends empirical Bayes shrinkage, elastic net, and
-# gbm across five pitcher-population buckets, with a per-bucket bias
-# correction and a TBF-adaptive blend on top.
+# Step 2 of 2. Predicts each pitcher's 2025 K% from k_2026_final_merged.csv
+# (written by data_merge.R, which must be run first). Blends
+# empirical Bayes shrinkage, a binomial elastic net, and logistic xgboost
+# for pitchers with MLB history, with simpler rules for three other pitcher
+# groups, and a per-group calibration on top. Every model predicts a
+# probability, so every prediction lies inside (0, 1).
 #
-# No column derived from Season >= 2025 is ever used as a predictive
-# input; all lag/trailing features are shifted forward.
+# No 2025 value except Age is ever used as a predictive input: all
+# lag/trailing features are shifted forward, and group routing uses only
+# seasons before the one being predicted. 2025 K% and TBF are used only
+# to score the predictions (TBF as the accuracy weight).
+#
+# References for the techniques used (links checked 2026-09-24):
+# [1] Empirical Bayes / beta-binomial shrinkage of a rate stat:
+#     D. Robinson, "Understanding empirical Bayes estimation (using baseball
+#     statistics)", http://varianceexplained.org/r/empirical_bayes_baseball/
+# [2] K% stabilization benchmark (70 BF): FanGraphs Library, "Sample Size",
+#     https://library.fangraphs.com/principles/sample-size/
+# [3] Elastic net for binomial GLMs: Friedman, Hastie & Tibshirani (2010),
+#     "Regularization Paths for Generalized Linear Models via Coordinate
+#     Descent", J. Stat. Softw. 33(1), https://www.jstatsoft.org/v33/i01/
+# [4] xgboost parameters and the binary:logistic objective:
+#     https://xgboost.readthedocs.io/en/stable/parameter.html
+# [5] Rolling-origin backtest: Hyndman & Athanasopoulos, Forecasting:
+#     Principles and Practice (3rd ed.), sec. 5.10,
+#     https://otexts.com/fpp3/tscv.html
+# [6] Grouped (blocked) cross-validation for repeated-measures data:
+#     Roberts et al. (2017), Ecography 40(8), https://doi.org/10.1111/ecog.02881
 
 library(readr)
 library(dplyr)
 library(tidyr)
 library(glmnet)
-library(gbm)
+library(xgboost)
 
 set.seed(2026)
 
@@ -25,9 +46,34 @@ set.seed(2026)
 
 data_dir <- "."
 
-# Min career single-season PA to count as a confirmed position player.
-# Can only raise the source file's own floor, not lower it — see Step 1.
-hitting_pa_floor <- 100
+# z for an 80% two-sided normal interval
+interval_z <- qnorm(0.9)
+
+# Velocity/spin for the six most common pitch types.
+arsenal_cols <- c(
+  "ff_avg_speed", "ff_avg_spin", "sl_avg_speed", "sl_avg_spin",
+  "cu_avg_speed", "cu_avg_spin", "ch_avg_speed", "ch_avg_spin",
+  "si_avg_speed", "si_avg_spin", "fc_avg_speed", "fc_avg_spin"
+)
+
+# K_pct/TBF/StuffPlus/role_ratio need both lag1 and lag2; every rate-stat
+# and arsenal column only ever appears as _lag1 in feat_cols.
+lag_both_cols <- c("K_pct", "TBF", "StuffPlus", "role_ratio")
+lag1_only_cols <- c(
+  "bb_percent", "whiff_percent", "oz_swing_percent", "z_swing_miss_percent",
+  "hard_hit_percent", "barrel_batted_rate", "edge_percent", "f_strike_percent",
+  "groundballs_percent", "fastball_avg_speed", "csw_percent", arsenal_cols
+)
+
+# Prior MiLB season stats used by the newcomer translation model (Step 7).
+milb_feat_cols <- c(
+  "milb_k_percent", "milb_bb_percent", "milb_swing_miss_percent",
+  "milb_xwoba", "milb_velocity", "milb_hardhit_percent"
+)
+
+# Every column of the merged file that feeds a model, as named on disk.
+raw_input_cols <- c("K%", "TBF", "Stuff+", "Age", "Season", "p_game", "p_starting_p",
+                    lag1_only_cols, milb_feat_cols)
 
 
 # =============================================================================
@@ -51,6 +97,25 @@ report_noise_floor <- function(pred, actual, w, label) {
               label, achieved, floor, excess))
 }
 
+#' Binomial log-loss per batter faced: -mean over batters of
+#' y*log(p) + (1-y)*log(1-p). The loss the probability models minimize.
+binom_logloss <- function(pred, actual, w) {
+  p <- pmin(pmax(pred, 1e-6), 1 - 1e-6)
+  -sum(w * (actual * log(p) + (1 - actual) * log(1 - p))) / sum(w)
+}
+
+#' TBF-weighted R^2 against the TBF-weighted mean of actual K%.
+wr2 <- function(pred, actual, w) {
+  1 - sum(w * (actual - pred)^2) / sum(w * (actual - weighted.mean(actual, w))^2)
+}
+
+#' Model-error variance left after removing binomial sampling noise:
+#' E[(pred - actual)^2] ~= sigma2_model + p(1-p)/TBF, so
+#' sigma2_model ~= weighted mean of (squared error - p(1-p)/TBF), floored at 0.
+model_error_var <- function(pred, actual, w) {
+  max(0, weighted.mean((pred - actual)^2 - pred * (1 - pred) / w, w))
+}
+
 
 # ── Step 1: Load Merged Data ─────────────────────────────────────────────────
 cat("\n=== Step 1: Loading merged data ===\n")
@@ -60,19 +125,30 @@ cat("\n=== Step 1: Loading merged data ===\n")
 d <- read_csv(file.path(data_dir, "k_2026_final_merged.csv"), show_col_types = FALSE,
               guess_max = 10000)
 
-# Savant hitting leaderboard — diagnostic only. has_batting_record for
-# 2025 rows comes from the merged file itself (Step 10), not from this.
-hitting <- read_csv(file.path(data_dir, "MLBBaseballSavantHittersData2015-2024.csv"), show_col_types = FALSE)
-
-if (hitting_pa_floor < min(hitting$pa, na.rm = TRUE)) {
-  warning("hitting_pa_floor (", hitting_pa_floor, ") is below the floor already ",
-          "applied when this file was pulled (min pa in file = ",
-          min(hitting$pa, na.rm = TRUE), "). Re-pull the Savant leaderboard at ",
-          "a lower PA minimum to actually lower the effective floor.")
+# Schema check: every model input must exist and be numeric. A stray text
+# token (e.g. "--") makes readr read the whole column as text, which would
+# otherwise surface only as an opaque error deep inside model fitting.
+# (A column that is entirely blank reads as logical; that is harmless.)
+missing_cols <- setdiff(raw_input_cols, names(d))
+if (length(missing_cols) > 0) {
+  stop("k_2026_final_merged.csv is missing input column(s): ",
+       paste(missing_cols, collapse = ", "), call. = FALSE)
 }
-batter_ids <- hitting %>% filter(pa >= hitting_pa_floor) %>% pull(player_id) %>% unique()
-cat("hitting_pa_floor:", hitting_pa_floor, " → batters qualifying:", length(batter_ids),
-    "of", length(unique(hitting$player_id)), "unique player-seasons in the file\n")
+not_numeric <- raw_input_cols[!vapply(d[raw_input_cols],
+                                      function(x) is.numeric(x) || all(is.na(x)), logical(1))]
+if (length(not_numeric) > 0) {
+  examples <- vapply(not_numeric, function(col) {
+    x <- d[[col]]
+    bad_value <- x[!is.na(x) & is.na(suppressWarnings(as.numeric(x)))][1]
+    sprintf("%s (e.g. \"%s\" in row %d)", col, bad_value, match(bad_value, x))
+  }, character(1))
+  stop("Non-numeric values in input column(s): ", paste(examples, collapse = "; "),
+       ". Fix or blank them in the source file and re-run the merge.", call. = FALSE)
+}
+
+# lag() below assumes exactly one row per player-season; a duplicate row
+# would make a lag feature equal that row's own K% (target leakage).
+stopifnot(!anyDuplicated(d[c("PlayerId", "Season")]), all(d$TBF > 0))
 
 d <- d %>% rename(K_pct = `K%`, StuffPlus = `Stuff+`)
 
@@ -93,29 +169,23 @@ d <- d %>% left_join(league_by_season %>% select(Season, league_k_trailing), by 
 
 d <- d %>% arrange(PlayerId, Season)
 
-# Velocity/spin for the six most common pitch types.
-arsenal_cols <- c(
-  "ff_avg_speed", "ff_avg_spin", "sl_avg_speed", "sl_avg_spin",
-  "cu_avg_speed", "cu_avg_spin", "ch_avg_speed", "ch_avg_spin",
-  "si_avg_speed", "si_avg_spin", "fc_avg_speed", "fc_avg_spin"
-)
-
-# K_pct/TBF/StuffPlus/role_ratio need both lag1 and lag2; every rate-stat
-# and arsenal column only ever appears as _lag1 in feat_cols.
-lag_both_cols <- c("K_pct", "TBF", "StuffPlus", "role_ratio")
-lag1_only_cols <- c(
-  "bb_percent", "whiff_percent", "oz_swing_percent", "z_swing_miss_percent",
-  "hard_hit_percent", "barrel_batted_rate", "edge_percent", "f_strike_percent",
-  "groundballs_percent", "fastball_avg_speed", "csw_percent", arsenal_cols
-)
 d <- d %>%
   group_by(PlayerId) %>%
   mutate(across(all_of(lag_both_cols), list(lag1 = ~lag(., 1), lag2 = ~lag(., 2)),
                 .names = "{.col}_{.fn}")) %>%
   mutate(across(all_of(lag1_only_cols), ~lag(., 1), .names = "{.col}_lag1")) %>%
-  ungroup()
+  # lag() steps back one ROW, not one season. Blank any lag whose source
+  # row isn't exactly 1 (or 2) seasons back, so a 2023 season is never
+  # presented to a 2025 row as "last season".
+  mutate(gap1 = Season - lag(Season, 1), gap2 = Season - lag(Season, 2)) %>%
+  mutate(across(ends_with("_lag1"), ~ if_else(gap1 %in% 1, .x, NA)),
+         across(ends_with("_lag2"), ~ if_else(gap2 %in% 2, .x, NA))) %>%
+  ungroup() %>%
+  select(-gap1, -gap2)
 
-# TBF-weighted trailing avg K% over up to 3 prior seasons, vectorized.
+# TBF-weighted trailing avg K% over up to 3 prior seasons played, vectorized.
+# (Deliberately seasons *played*, not calendar seasons: an older season is
+# still real history, and EB weights it by its TBF.)
 d <- d %>%
   group_by(PlayerId) %>%
   mutate(
@@ -166,11 +236,19 @@ cat("Rows with zero prior seasons (true cold start):",
 # ── Step 3: Population Routing (Bucket Assignment) ───────────────────────────
 cat("\n=== Step 3: Assigning buckets ===\n")
 
+# Routing uses only information from seasons before the row's own (flags
+# built as-of in the merge), so every season, 2021-2024 and 2025 alike, is
+# routed by the same rule and each bucket means the same thing every year:
+#   C  position player: an MLB hitting season on file, no MLB pitching season
+#   A  pitcher with at least one prior season in k_2026
+#   B1 no prior k_2026 season, but a prior MiLB season on file
+#   B2 no prior k_2026 season and no MiLB record
 d <- d %>%
   mutate(bucket = case_when(
-    likely_position_player ~ "C_position_player",
-    n_prior_seasons == 0    ~ "B_rookie_no_lag",
-    TRUE                    ~ "A_full_model"
+    has_prior_batting & !has_prior_pitching ~ "C_position_player",
+    n_prior_seasons > 0                     ~ "A_full_model",
+    !is.na(milb_year)                       ~ "B1_no_history_milb",
+    TRUE                                    ~ "B2_no_history_fallback"
   ))
 
 cat("Bucket sizes by season:\n")
@@ -191,8 +269,8 @@ d <- d %>% left_join(pp_context %>% select(Season, pp_k_trailing), by = "Season"
 # =============================================================================
 # Shared Model-Fitting Functions
 #
-# One set of functions fits/predicts EB + glmnet + gbm on any train/target
-# split. Steps 4-6 and 10 all call these.
+# One set of functions fits/predicts EB + glmnet + xgboost on any
+# train/target split. Steps 4-6 and 10 all call these.
 # =============================================================================
 
 feat_cols <- c(
@@ -212,7 +290,11 @@ feat_cols <- c(
 k_grid <- seq(10, 400, by = 5)
 
 #' EB shrinkage prediction: pred = w*trail_K + (1-w)*league context,
-#' w = trail_TBF_sum / (trail_TBF_sum + k).
+#' w = trail_TBF_sum / (trail_TBF_sum + k). Equivalent to the beta-binomial
+#' posterior mean (K + k*m)/(TBF + k) with prior mean m and prior strength
+#' k batters faced [1]. k is fit to minimize next-season error, so it is
+#' larger than K%'s within-season stabilization point (~70 BF [2]): it must
+#' also absorb real year-to-year changes in talent.
 eb_predict <- function(dat, k) {
   w <- dat$trail_TBF_sum / (dat$trail_TBF_sum + k)
   w * dat$trail_K_weighted + (1 - w) * dat$league_k_trailing
@@ -249,85 +331,113 @@ align_matrix <- function(X, train_cols) {
   X[, train_cols, drop = FALSE]
 }
 
-#' Pick gbm tree count by checking staged predictions against a real
-#' held-out fold, instead of gbm's internal (random, non-time-respecting)
-#' cv.folds.
-select_ntrees_by_holdout <- function(fit, Xva_aligned, actual, w, checkpoint_step = 10) {
-  max_trees <- fit$n.trees
-  checkpoints <- seq(checkpoint_step, max_trees, by = checkpoint_step)
-  preds <- predict(fit, newdata = as.data.frame(Xva_aligned), n.trees = checkpoints)
-  errs <- apply(preds, 2, function(p) wrmse(p, actual, w))
-  checkpoints[which.min(errs)]
+# Hyperparameters are chosen inside every training window by pitcher-grouped
+# cross-validation on binomial log-loss (fit_stage_models below), never on
+# the 2023/2024 backtest seasons, so those stay an honest test.
+#   Elastic net mixing alpha: 0 = ridge (L2) ... 1 = lasso (L1); lambda
+#     (penalty strength) is tuned along its whole path for each alpha.
+#   xgboost tree depth and minimum leaf size [4]. min_child_weight is in TBF
+#     units (the weights), so it is the fewest batters faced a leaf may hold.
+#   xgboost rounds: early stopping on the same CV folds.
+# Learning rate and row/column subsampling stay fixed at conventional values:
+# with early stopping, a smaller learning rate mostly trades speed for a
+# slightly smoother fit.
+glmnet_alpha_grid <- c(0, 0.25, 0.5, 0.75, 1)
+xgb_tune_grid <- expand.grid(max_depth = c(2, 3, 4, 6), min_child_weight = c(20, 50, 100))
+xgb_base_params <- list(objective = "binary:logistic", eval_metric = "logloss",
+                        eta = 0.02, subsample = 0.7, colsample_bytree = 0.7,
+                        lambda = 1, nthread = 2)
+n_cv_folds <- 5
+
+#' Cross-validation folds that keep all of a pitcher's seasons together, so
+#' tuning never scores a pitcher the model already saw [6] (used only inside
+#' a training window; the backtest itself is split by season [5]).
+pitcher_folds <- function(ids, n = n_cv_folds) {
+  u <- unique(ids)
+  f <- sample(rep(seq_len(n), length.out = length(u)))
+  f[match(ids, u)]
 }
 
-#' Fit EB + glmnet + gbm on `train`. gbm is fit on the same imputed +
-#' flagged matrix as glmnet, not raw NA columns, so a rare feature that's
-#' 100% missing in a thin fold can't crash gbm's fit.
-#'
-#' n.trees selection (exactly one mode applies per call):
-#'   valid supplied            → fit to gbm_ntrees_max, pick n.trees via holdout on valid
-#'   gbm_ntrees_fixed supplied → fit exactly that many trees, no search
-#'   neither supplied          → fall back to gbm's internal cv.folds
-fit_stage_models <- function(train, feats = feat_cols, gbm_depth = 3, gbm_shrink = 0.01,
-                             gbm_ntrees_max = 2000, valid = NULL, gbm_ntrees_fixed = NULL) {
+#' Shrink the K% inputs before the elastic net and xgboost see them:
+#' (K + k*m)/(TBF + k), the beta-binomial posterior mean [1] toward the prior
+#' season's league rate m, with the same k (in TBF) as the EB model. So a
+#' 3-for-3 season enters the models as ~league average, not 100%.
+#' (Shrinking the other prior-season rates, e.g. whiff%, the same way was
+#' also tested; it made the 2023-2024 backtest worse, 0.0398 vs 0.0395
+#' RMSE, so they enter raw.)
+shrink_k_inputs <- function(dat, k) {
+  dat %>% mutate(
+    K_pct_lag1 = (K_pct_lag1 * TBF_lag1 + k * league_k_trailing) / (TBF_lag1 + k),
+    K_pct_lag2 = (K_pct_lag2 * TBF_lag2 + k * league_k_trailing) / (TBF_lag2 + k),
+    trail_K_weighted = (trail_K_weighted * trail_TBF_sum + k * league_k_trailing) / (trail_TBF_sum + k)
+  )
+}
+
+#' Binomial elastic net on a (non-strikeouts, strikeouts) count matrix. Each
+#' alpha gets its own lambda path on the same pitcher-grouped folds; keep the
+#' alpha whose best lambda has the lowest CV binomial deviance.
+#' See reference [3].
+fit_glmnet_tuned <- function(X, y_counts, folds) {
+  fits <- lapply(glmnet_alpha_grid, function(a)
+    cv.glmnet(X, y_counts, family = "binomial", alpha = a, foldid = folds))
+  best <- which.min(sapply(fits, function(f) min(f$cvm)))
+  list(fit = fits[[best]], alpha = glmnet_alpha_grid[best])
+}
+
+#' Fit EB + binomial elastic net + logistic xgboost on `train`. All three
+#' predict a probability, so every output is inside (0, 1) by construction.
+fit_stage_models <- function(train, feats = feat_cols) {
   k <- fit_eb(train)
+  train <- shrink_k_inputs(train, k)
   mm <- build_matrix(train, feats)
-  fit_glmnet <- cv.glmnet(mm$X, train$K_pct, weights = train$TBF, alpha = 0.5, family = "gaussian")
-  gbm_df <- as.data.frame(mm$X)
-  gbm_df$K_pct <- train$K_pct
-  gbm_df$TBF <- train$TBF
-  
-  # Drop zero-variance columns from gbm's formula only (glmnet's
-  # regularization already zeroes these out; gbm just warns/crashes on them).
-  has_variation <- apply(mm$X, 2, function(col) length(unique(col)) > 1)
-  gbm_feats <- colnames(mm$X)[has_variation]
-  
-  if (!is.null(gbm_ntrees_fixed)) {
-    fit_gbm <- gbm(as.formula(paste("K_pct ~", paste(gbm_feats, collapse = " + "))),
-                   data = gbm_df, weights = TBF, distribution = "gaussian",
-                   n.trees = gbm_ntrees_fixed, interaction.depth = gbm_depth,
-                   shrinkage = gbm_shrink, cv.folds = 0, verbose = FALSE)
-    best_iter <- gbm_ntrees_fixed
-  } else if (!is.null(valid)) {
-    fit_gbm <- gbm(as.formula(paste("K_pct ~", paste(gbm_feats, collapse = " + "))),
-                   data = gbm_df, weights = TBF, distribution = "gaussian",
-                   n.trees = gbm_ntrees_max, interaction.depth = gbm_depth,
-                   shrinkage = gbm_shrink, cv.folds = 0, verbose = FALSE)
-    mm_va <- build_matrix(valid, feats, impute_vals = mm$impute_vals)
-    Xva <- align_matrix(mm_va$X, colnames(mm$X))
-    best_iter <- select_ntrees_by_holdout(fit_gbm, Xva, valid$K_pct, valid$TBF)
-  } else {
-    fit_gbm <- gbm(as.formula(paste("K_pct ~", paste(gbm_feats, collapse = " + "))),
-                   data = gbm_df, weights = TBF, distribution = "gaussian",
-                   n.trees = gbm_ntrees_max, interaction.depth = gbm_depth,
-                   shrinkage = gbm_shrink, cv.folds = 5, verbose = FALSE)
-    best_iter <- gbm.perf(fit_gbm, method = "cv", plot.it = FALSE)
-  }
-  list(k = k, fit_glmnet = fit_glmnet, fit_gbm = fit_gbm, best_iter = best_iter,
+  folds <- pitcher_folds(train$PlayerId)
+  strikeouts <- train$K_pct * train$TBF
+
+  # Elastic net on strikeout counts, alpha and lambda tuned by grouped CV.
+  en <- fit_glmnet_tuned(mm$X, cbind(train$TBF - strikeouts, strikeouts), folds)
+  fit_glmnet <- en$fit
+
+  # xgboost on K% with TBF weights = the same binomial log-likelihood. Each
+  # depth / leaf-size pair is early-stopped on the same folds; keep the pair
+  # (and its round count) with the lowest CV log-loss.
+  dtrain <- xgb.DMatrix(mm$X, label = train$K_pct, weight = train$TBF)
+  fold_index <- lapply(seq_len(n_cv_folds), function(f) which(folds == f))
+  xgb_cv <- lapply(seq_len(nrow(xgb_tune_grid)), function(g) {
+    params <- c(xgb_base_params, as.list(xgb_tune_grid[g, ]))
+    log <- xgb.cv(params, dtrain, nrounds = 3000, folds = fold_index,
+                  early_stopping_rounds = 100, verbose = 0)$evaluation_log
+    list(params = params, n_rounds = which.min(log$test_logloss_mean),
+         logloss = min(log$test_logloss_mean))
+  })
+  best_xgb <- xgb_cv[[which.min(sapply(xgb_cv, `[[`, "logloss"))]]
+  fit_xgb <- xgb.train(best_xgb$params, dtrain, nrounds = best_xgb$n_rounds, verbose = 0)
+
+  list(k = k, fit_glmnet = fit_glmnet, glmnet_alpha = en$alpha,
+       fit_xgb = fit_xgb, xgb_params = best_xgb$params, n_rounds = best_xgb$n_rounds,
        impute_vals = mm$impute_vals, train_cols = colnames(mm$X), feats = feats)
 }
 
-#' Apply a model bundle to newdata; adds pred_EB/pred_glmnet/pred_gbm.
+#' Apply a model bundle to newdata; adds pred_EB/pred_glmnet/pred_xgb.
 predict_stage_models <- function(models, newdata) {
   newdata$pred_EB <- eb_predict(newdata, models$k)
-  mm <- build_matrix(newdata, models$feats, impute_vals = models$impute_vals)
+  shrunk <- shrink_k_inputs(newdata, models$k)
+  mm <- build_matrix(shrunk, models$feats, impute_vals = models$impute_vals)
   Xaligned <- align_matrix(mm$X, models$train_cols)
-  newdata$pred_glmnet <- as.numeric(predict(models$fit_glmnet, newx = Xaligned, s = "lambda.min"))
-  newdata$pred_gbm <- predict(models$fit_gbm, newdata = as.data.frame(Xaligned), n.trees = models$best_iter)
+  newdata$pred_glmnet <- as.numeric(predict(models$fit_glmnet, newx = Xaligned, s = "lambda.min", type = "response"))
+  newdata$pred_xgb <- predict(models$fit_xgb, xgb.DMatrix(Xaligned))
   newdata
 }
 
-blend_predict <- function(dat, w) w["EB"] * dat$pred_EB + w["glmnet"] * dat$pred_glmnet + w["gbm"] * dat$pred_gbm
+blend_predict <- function(dat, w) w["EB"] * dat$pred_EB + w["glmnet"] * dat$pred_glmnet + w["xgb"] * dat$pred_xgb
 
 #' Grid-search non-negative, sum-to-one blend weights on `dat`. Constrained
-#' rather than an unconstrained lm(), which handed gbm a negative weight
-#' on one validation season — a sign of overfitting the blend itself.
+#' rather than an unconstrained lm(), which can hand a model a negative
+#' weight — a sign of overfitting the blend itself.
 fit_blend_weights <- function(dat, grid_step = 0.05) {
-  best <- list(rmse = Inf, w = c(1/3, 1/3, 1/3))
+  best <- list(rmse = Inf, w = c(EB = 1/3, glmnet = 1/3, xgb = 1/3))
   for (w_eb in seq(0, 1, by = grid_step)) {
     for (w_glm in seq(0, 1 - w_eb, by = grid_step)) {
-      w_gbm <- 1 - w_eb - w_glm
-      w <- c(EB = w_eb, glmnet = w_glm, gbm = w_gbm)
+      w <- c(EB = w_eb, glmnet = w_glm, xgb = 1 - w_eb - w_glm)
       r <- wrmse(blend_predict(dat, w), dat$K_pct, dat$TBF)
       if (r < best$rmse) best <- list(rmse = r, w = w)
     }
@@ -336,9 +446,11 @@ fit_blend_weights <- function(dat, grid_step = 0.05) {
 }
 
 
-# ── Step 4: gbm Hyperparameter Tuning (Bucket A) ─────────────────────────────
-# n.trees isn't in the grid — select_ntrees_by_holdout() picks it per fit.
-cat("\n=== Step 4: gbm hyperparameter tuning (pooled 2023+2024 validation) ===\n")
+# ── Steps 4-5: Rolling-Origin Backtest (Bucket A) ────────────────────────────
+# Train on seasons before t, predict t, for t = 2023 and 2024 [5]. Nothing
+# about the models is tuned on the season being predicted; blend weights are
+# then fit on the pooled out-of-sample predictions (Step 6).
+cat("\n=== Steps 4-5: Bucket A rolling-origin backtest ===\n")
 
 bucket_A <- d %>% filter(bucket == "A_full_model")
 
@@ -347,121 +459,57 @@ folds <- list(
   list(train = bucket_A %>% filter(Season <= 2023), valid = bucket_A %>% filter(Season == 2024))
 )
 
-# Built once per fold, reused across every hyperparameter combo below.
-mm_fold <- lapply(folds, function(f) {
-  mm <- build_matrix(f$train, feat_cols)
-  mm_va <- build_matrix(f$valid, feat_cols, impute_vals = mm$impute_vals)
-  list(train = f$train, valid = f$valid, mm = mm, Xva = align_matrix(mm_va$X, colnames(mm$X)))
-})
-
-tune_grid <- expand.grid(interaction.depth = c(2, 3, 4), shrinkage = c(0.01, 0.02))
-tune_ntrees_max <- 1500
-tune_results <- vector("list", nrow(tune_grid))
-for (g in seq_len(nrow(tune_grid))) {
-  depth <- tune_grid$interaction.depth[g]; shrink <- tune_grid$shrinkage[g]
-  fold_preds <- list()
-  for (i in seq_along(mm_fold)) {
-    mf <- mm_fold[[i]]
-    gbm_df <- as.data.frame(mf$mm$X); gbm_df$K_pct <- mf$train$K_pct; gbm_df$TBF <- mf$train$TBF
-    has_variation <- apply(mf$mm$X, 2, function(col) length(unique(col)) > 1)
-    gbm_feats <- colnames(mf$mm$X)[has_variation]
-    fit <- gbm(as.formula(paste("K_pct ~", paste(gbm_feats, collapse = " + "))),
-               data = gbm_df, weights = TBF, distribution = "gaussian",
-               n.trees = tune_ntrees_max, interaction.depth = depth, shrinkage = shrink,
-               cv.folds = 0, verbose = FALSE)
-    best_iter <- select_ntrees_by_holdout(fit, mf$Xva, mf$valid$K_pct, mf$valid$TBF)
-    pred <- predict(fit, newdata = as.data.frame(mf$Xva), n.trees = best_iter)
-    fold_preds[[i]] <- tibble(pred = pred, actual = mf$valid$K_pct, w = mf$valid$TBF)
-  }
-  pooled <- bind_rows(fold_preds)
-  tune_results[[g]] <- tibble(interaction.depth = depth, shrinkage = shrink,
-                              RMSE = wrmse(pooled$pred, pooled$actual, pooled$w))
-}
-tune_results <- bind_rows(tune_results) %>% arrange(RMSE)
-print(tune_results)
-gbm_depth  <- tune_results$interaction.depth[1]
-gbm_shrink <- tune_results$shrinkage[1]
-cat("Chosen: interaction.depth =", gbm_depth, " shrinkage =", gbm_shrink, "\n")
-
-
-# ── Step 5: Rolling-Origin Backtest (Bucket A) ───────────────────────────────
-# Predictions from both folds are pooled before fitting blend weights.
-cat("\n=== Step 5: Bucket A rolling-origin backtest ===\n")
-
 pooled_valid <- list()
-fold_best_iter <- integer(length(folds))
 for (i in seq_along(folds)) {
   tr <- folds[[i]]$train; va <- folds[[i]]$valid
   cat("Fold", i, "→ train n =", nrow(tr), " valid n =", nrow(va),
       " (valid season", unique(va$Season), ")\n")
-  models <- fit_stage_models(tr, gbm_depth = gbm_depth, gbm_shrink = gbm_shrink, valid = va)
+  models <- fit_stage_models(tr)
   va <- predict_stage_models(models, va)
-  cat("  EB k:", models$k, " gbm best n.trees:", models$best_iter, "\n")
+  cat("  EB k:", models$k, " elastic net alpha:", models$glmnet_alpha,
+      " xgboost depth / min leaf TBF / rounds:", models$xgb_params$max_depth, "/",
+      models$xgb_params$min_child_weight, "/", models$n_rounds, "\n")
   pooled_valid[[i]] <- va
-  fold_best_iter[i] <- models$best_iter
 }
 pooled_valid <- bind_rows(pooled_valid)
 
 metrics <- tibble(
   model = c("League mean (naive)", "Trailing weighted avg (naive)",
-            "Empirical Bayes shrinkage", "Elastic net", "GBM"),
+            "Empirical Bayes shrinkage", "Elastic net (binomial)", "XGBoost (logistic)"),
   RMSE = c(wrmse(pooled_valid$league_k_trailing, pooled_valid$K_pct, pooled_valid$TBF),
            wrmse(pooled_valid$trail_K_weighted, pooled_valid$K_pct, pooled_valid$TBF),
            wrmse(pooled_valid$pred_EB, pooled_valid$K_pct, pooled_valid$TBF),
            wrmse(pooled_valid$pred_glmnet, pooled_valid$K_pct, pooled_valid$TBF),
-           wrmse(pooled_valid$pred_gbm, pooled_valid$K_pct, pooled_valid$TBF)),
+           wrmse(pooled_valid$pred_xgb, pooled_valid$K_pct, pooled_valid$TBF)),
   MAE  = c(wmae(pooled_valid$league_k_trailing, pooled_valid$K_pct, pooled_valid$TBF),
            wmae(pooled_valid$trail_K_weighted, pooled_valid$K_pct, pooled_valid$TBF),
            wmae(pooled_valid$pred_EB, pooled_valid$K_pct, pooled_valid$TBF),
            wmae(pooled_valid$pred_glmnet, pooled_valid$K_pct, pooled_valid$TBF),
-           wmae(pooled_valid$pred_gbm, pooled_valid$K_pct, pooled_valid$TBF))
+           wmae(pooled_valid$pred_xgb, pooled_valid$K_pct, pooled_valid$TBF))
 )
 cat("\nPooled 2023+2024 backtest (n =", nrow(pooled_valid), "):\n")
 print(metrics)
 
 
-# ── Step 6: Blend Weights, Global and TBF-Adaptive (Bucket A) ────────────────
+# ── Step 6: Blend Weights (Bucket A) ─────────────────────────────────────────
+# One set of non-negative, sum-to-one weights for all Bucket A pitchers.
+# (An earlier version switched weights by batters-faced tier; it chose
+# tiers from the season being predicted and did not beat this out of
+# sample, so it was removed.)
 cat("\n=== Step 6: Fitting blend weights ===\n")
 
 blend_w <- fit_blend_weights(pooled_valid)
-cat("Global blend weights (fit on pooled 2023+2024 validation):\n")
+cat("Blend weights (fit on pooled 2023+2024 validation):\n")
 print(round(blend_w, 3))
-pooled_valid$pred_blend_global <- blend_predict(pooled_valid, blend_w)
-global_blend_rmse <- wrmse(pooled_valid$pred_blend_global, pooled_valid$K_pct, pooled_valid$TBF)
-cat("Global blend RMSE (pooled):", round(global_blend_rmse, 4),
-    " MAE:", round(wmae(pooled_valid$pred_blend_global, pooled_valid$K_pct, pooled_valid$TBF), 4), "\n")
+pooled_valid$pred_blend <- blend_predict(pooled_valid, blend_w)
+cat("Blend RMSE (pooled):", round(wrmse(pooled_valid$pred_blend, pooled_valid$K_pct, pooled_valid$TBF), 4),
+    " MAE:", round(wmae(pooled_valid$pred_blend, pooled_valid$K_pct, pooled_valid$TBF), 4),
+    " log-loss:", round(binom_logloss(pooled_valid$pred_blend, pooled_valid$K_pct, pooled_valid$TBF), 5), "\n")
 
-# One global blend weight assumes EB/glmnet/gbm trade off the same way at
-# every sample size; they don't. tbf_breaks are fixed here and reused
-# as-is on 2025 in Step 10, never recomputed from 2025's own distribution.
+# Diagnostic only (scored after the fact, never used to make a prediction):
+# how much of the error at each workload level is irreducible sampling noise.
 tbf_breaks <- quantile(pooled_valid$TBF, probs = c(1 / 3, 2 / 3))
-assign_tbf_tier <- function(tbf) case_when(tbf <= tbf_breaks[1] ~ 1L, tbf <= tbf_breaks[2] ~ 2L, TRUE ~ 3L)
-pooled_valid$tbf_tier <- assign_tbf_tier(pooled_valid$TBF)
-
-blend_w_by_tier <- lapply(1:3, function(t) fit_blend_weights(pooled_valid %>% filter(tbf_tier == t)))
-pooled_valid$pred_blend_adaptive <- NA_real_
-for (t in 1:3) {
-  idx <- pooled_valid$tbf_tier == t
-  pooled_valid$pred_blend_adaptive[idx] <- blend_predict(pooled_valid[idx, ], blend_w_by_tier[[t]])
-}
-adaptive_blend_rmse <- wrmse(pooled_valid$pred_blend_adaptive, pooled_valid$K_pct, pooled_valid$TBF)
-
-cat("\nTBF-adaptive blend weights, by tercile (breakpoints TBF <=",
-    round(tbf_breaks[1]), "/ <=", round(tbf_breaks[2]), "):\n")
-for (t in 1:3) cat("  Tier", t, ": EB =", round(blend_w_by_tier[[t]]["EB"], 3),
-                   " glmnet =", round(blend_w_by_tier[[t]]["glmnet"], 3),
-                   " gbm =", round(blend_w_by_tier[[t]]["gbm"], 3), "\n")
-cat("Adaptive blend RMSE (pooled):", round(adaptive_blend_rmse, 4), "\n")
-cat("Global   blend RMSE (pooled):", round(global_blend_rmse, 4), "\n")
-
-# Only switch to the adaptive blend for 2025 if it actually beats the
-# global blend on this backtest — three small fits can overfit each tier.
-use_adaptive_blend <- adaptive_blend_rmse < global_blend_rmse
-cat(if (use_adaptive_blend) "→ Adaptive blend wins; using it for 2025.\n"
-    else "→ Global blend wins (or ties); adaptive blend not worth the extra complexity here.\n")
-pooled_valid$pred_blend <- if (use_adaptive_blend) pooled_valid$pred_blend_adaptive else pooled_valid$pred_blend_global
-bucketA_backtest_rmse <- wrmse(pooled_valid$pred_blend, pooled_valid$K_pct, pooled_valid$TBF)
-
+pooled_valid$tbf_tier <- findInterval(pooled_valid$TBF, tbf_breaks, left.open = TRUE) + 1
 cat("\nNoise floor check, Bucket A pooled backtest, by TBF tercile:\n")
 for (t in 1:3) {
   sub <- pooled_valid %>% filter(tbf_tier == t)
@@ -470,79 +518,94 @@ for (t in 1:3) {
 }
 
 
-# ── Step 7: MiLB-to-MLB Translation Model (Bucket C2) ────────────────────────
-# Trained on early-career players (n_prior_seasons <= 1) with a recent AAA
+# ── Step 7: MiLB-to-MLB Translation Model (Bucket B1) ────────────────────────
+# Trained on early-career players (n_prior_seasons <= 1) with a prior MiLB
 # season on file — excludes established MLB pitchers on a rehab stint,
 # whose true K% is driven by MLB track record, not one minor-league season.
+# The MiLB file has no level column and covers 2022-2024.
 cat("\n=== Step 7: MiLB translation model ===\n")
 
-milb_feat_cols <- c(
-  "milb_k_percent", "milb_bb_percent", "milb_swing_miss_percent",
-  "milb_xwoba", "milb_velocity", "milb_hardhit_percent"
-)
-translate_pop <- d %>% filter(!is.na(milb_year), n_prior_seasons <= 1)
+translate_pop <- d %>% filter(!is.na(milb_year), n_prior_seasons <= 1, Season <= 2024)
 cat("Training population by season:\n")
 print(table(translate_pop$Season))
 
-milb_train1 <- translate_pop %>% filter(Season == 2023)
-milb_valid  <- translate_pop %>% filter(Season == 2024)
-mm_milb_train1 <- build_matrix(milb_train1, milb_feat_cols)
-mm_milb_valid  <- build_matrix(milb_valid, milb_feat_cols, impute_vals = mm_milb_train1$impute_vals)
-fit_milb1 <- cv.glmnet(mm_milb_train1$X, milb_train1$K_pct, weights = milb_train1$TBF,
-                       alpha = 0.5, family = "gaussian")
-milb_valid$pred_milb <- as.numeric(predict(fit_milb1, newx = mm_milb_valid$X, s = "lambda.min"))
+#' Predict with a fitted MiLB glmnet, using the same imputation, missing
+#' flags, and column alignment as its training matrix.
+predict_milb <- function(fit, mm_train, newdata) {
+  mm_new <- build_matrix(newdata, milb_feat_cols, impute_vals = mm_train$impute_vals)
+  as.numeric(predict(fit, newx = align_matrix(mm_new$X, colnames(mm_train$X)),
+                     s = "lambda.min", type = "response"))
+}
 
-cat("\n2024 backtest, early-career milb-matched players (n =", nrow(milb_valid), "):\n")
-cat("  League mean baseline: RMSE", round(wrmse(milb_valid$league_k_trailing, milb_valid$K_pct, milb_valid$TBF), 4),
-    " MAE", round(wmae(milb_valid$league_k_trailing, milb_valid$K_pct, milb_valid$TBF), 4), "\n")
-milb_c2_backtest_rmse <- wrmse(milb_valid$pred_milb, milb_valid$K_pct, milb_valid$TBF)
-cat("  MiLB translation:     RMSE", round(milb_c2_backtest_rmse, 4),
-    " MAE", round(wmae(milb_valid$pred_milb, milb_valid$K_pct, milb_valid$TBF), 4), "\n")
+#' Binomial elastic net on strikeout counts, tuned the same way as the
+#' Bucket A elastic net (alpha and lambda by pitcher-grouped CV).
+fit_milb <- function(dat, mm) {
+  strikeouts <- dat$K_pct * dat$TBF
+  fit_glmnet_tuned(mm$X, cbind(dat$TBF - strikeouts, strikeouts), pitcher_folds(dat$PlayerId))$fit
+}
+
+# Backtest: train on 2023, score 2024 Bucket B1 (2024 is the only season
+# with an earlier season to train on, since MiLB data starts in 2022).
+milb_train1 <- translate_pop %>% filter(Season == 2023)
+mm_milb_train1 <- build_matrix(milb_train1, milb_feat_cols)
+fit_milb1 <- fit_milb(milb_train1, mm_milb_train1)
+bucketB1_hist <- d %>% filter(bucket == "B1_no_history_milb", Season == 2024)
+bucketB1_hist$pred_rule <- predict_milb(fit_milb1, mm_milb_train1, bucketB1_hist)
+
+cat("\n2024 backtest, Bucket B1 (n =", nrow(bucketB1_hist), "):\n")
+cat("  League mean baseline: RMSE", round(wrmse(bucketB1_hist$league_k_trailing, bucketB1_hist$K_pct, bucketB1_hist$TBF), 4), "\n")
+cat("  MiLB translation:     RMSE", round(wrmse(bucketB1_hist$pred_rule, bucketB1_hist$K_pct, bucketB1_hist$TBF), 4), "\n")
 cat("\nCoefficients:\n")
 print(coef(fit_milb1, s = "lambda.min"))
 
-milb_final_train <- translate_pop %>% filter(Season <= 2024)
-mm_milb_final <- build_matrix(milb_final_train, milb_feat_cols)
-fit_milb_final <- cv.glmnet(mm_milb_final$X, milb_final_train$K_pct, weights = milb_final_train$TBF,
-                            alpha = 0.5, family = "gaussian")
-milb_impute_vals <- mm_milb_final$impute_vals
+mm_milb_final <- build_matrix(translate_pop, milb_feat_cols)
+fit_milb_final <- fit_milb(translate_pop, mm_milb_final)
 
 
-# ── Step 8: Backtested Error for Buckets B / C1 / C3 ─────────────────────────
-# Each bucket's prediction rule already existed in 2022-2024, so it gets
-# the same real backtest as Bucket A instead of an assumed interval.
-cat("\n=== Step 8: Backtested error for B / C1 / C3 prediction rules (2022-2024) ===\n")
+# ── Step 8: Backtested Error for Buckets B2 / C ──────────────────────────────
+# Each bucket's prediction rule already existed in 2022-2024 and routing is
+# identical in every season, so the backtest population matches 2025's.
+cat("\n=== Step 8: Backtested error for B2 / C prediction rules (2022-2024) ===\n")
 
-bucketB_hist <- d %>% filter(bucket == "B_rookie_no_lag", Season %in% 2022:2024)
-bucketB_backtest_rmse <- wrmse(bucketB_hist$league_k_trailing, bucketB_hist$K_pct, bucketB_hist$TBF)
+bucketB2_hist <- d %>% filter(bucket == "B2_no_history_fallback", Season %in% 2022:2024) %>%
+  mutate(pred_rule = league_k_trailing)
+bucketC_hist <- d %>% filter(bucket == "C_position_player", Season %in% 2022:2024) %>%
+  mutate(pred_rule = pp_k_trailing)
 
-bucketC1_hist <- d %>% filter(bucket == "C_position_player", Season %in% 2022:2024)
-bucketC1_backtest_rmse <- wrmse(bucketC1_hist$pp_k_trailing, bucketC1_hist$K_pct, bucketC1_hist$TBF)
-
-# C3 uses the identical rule as Bucket B (trailing league mean), so it
-# inherits that bucket's backtested error rather than having no estimate.
-cat("Bucket B / C3 rule (trailing league mean): RMSE", round(bucketB_backtest_rmse, 4), "\n")
-cat("Bucket C1 rule (trailing position-player mean): RMSE", round(bucketC1_backtest_rmse, 4), "\n")
+cat("Bucket B2 rule (trailing league mean):         n =", nrow(bucketB2_hist),
+    " RMSE", round(wrmse(bucketB2_hist$pred_rule, bucketB2_hist$K_pct, bucketB2_hist$TBF), 4), "\n")
+cat("Bucket C rule (trailing position-player mean): n =", nrow(bucketC_hist),
+    " RMSE", round(wrmse(bucketC_hist$pred_rule, bucketC_hist$K_pct, bucketC_hist$TBF), 4), "\n")
 
 
-# ── Step 9: Per-Bucket Bias Correction ───────────────────────────────────────
-# Each bucket's backtested predictions carry a small, systematic offset;
-# subtracting each bucket's own bias re-centers its 2025 predictions.
-cat("\n=== Step 9: Per-bucket bias correction ===\n")
+# ── Step 9: Per-Bucket Calibration and Interval Width ────────────────────────
+# Both come from pre-2025 backtests only, and every bucket gets the same
+# treatment. Calibration ratio = actual strikeouts / predicted strikeouts
+# over the bucket's backtest (sum of K_pct*TBF over sum of pred*TBF);
+# multiplying by it re-centers the bucket. A ratio rather than a subtracted
+# bias because K% is a rate: for pitchers (~22% K) the two are nearly
+# identical, but subtracting a 2-point bias from a ~1% position-player
+# rate would predict 0%. Interval width = model-error variance left after
+# removing binomial noise, measured on the calibrated predictions.
+cat("\n=== Step 9: Per-bucket calibration and interval width ===\n")
 
-bucket_bias <- c(
-  A_full_model = weighted.mean(pooled_valid$pred_blend - pooled_valid$K_pct, pooled_valid$TBF),
-  B_rookie_no_lag = weighted.mean(bucketB_hist$league_k_trailing - bucketB_hist$K_pct, bucketB_hist$TBF),
-  C1_confirmed_position_player = 0,
-  C2_milb_translation = weighted.mean(milb_valid$pred_milb - milb_valid$K_pct, milb_valid$TBF),
-  C3_no_record_fallback = weighted.mean(bucketB_hist$league_k_trailing - bucketB_hist$K_pct, bucketB_hist$TBF)
+backtests <- list(
+  A_full_model           = tibble(pred = pooled_valid$pred_blend, actual = pooled_valid$K_pct, w = pooled_valid$TBF),
+  B1_no_history_milb     = tibble(pred = bucketB1_hist$pred_rule, actual = bucketB1_hist$K_pct, w = bucketB1_hist$TBF),
+  B2_no_history_fallback = tibble(pred = bucketB2_hist$pred_rule, actual = bucketB2_hist$K_pct, w = bucketB2_hist$TBF),
+  C_position_player      = tibble(pred = bucketC_hist$pred_rule,  actual = bucketC_hist$K_pct,  w = bucketC_hist$TBF)
 )
-cat("Backtested bias (mean predicted - actual, TBF-weighted, 2022-2024):\n")
-print(round(bucket_bias, 4))
+bucket_calib <- sapply(backtests, function(b) sum(b$actual * b$w) / sum(b$pred * b$w))
+bucket_sigma2 <- mapply(function(b, ratio) {
+  model_error_var(pmin(b$pred * ratio, 1), b$actual, b$w)
+}, backtests, bucket_calib)
 
-# C1 forced to 0: bucketC1_hist is the general pre-2025 position-player
-# population, broader than 2025's confirmed-via-hitting-leaderboard C1
-# subset. Applying its bias made 2025 C1 RMSE worse, not better.
+calib_table <- tibble(bucket = names(backtests), n_backtest = sapply(backtests, nrow),
+                      backtest_rmse = sapply(backtests, function(b) wrmse(b$pred, b$actual, b$w)),
+                      actual_K = sapply(backtests, function(b) sum(b$actual * b$w)),
+                      predicted_K = sapply(backtests, function(b) sum(b$pred * b$w)),
+                      calib_ratio = bucket_calib, model_error_sd = sqrt(bucket_sigma2))
+print(calib_table %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
 
 
 # ── Step 10: Final Refit and 2025 Predictions (All Buckets) ─────────────────
@@ -551,102 +614,75 @@ cat("\n=== Step 10: Final refit and 2025 predictions ===\n")
 final_train <- bucket_A %>% filter(Season <= 2024)
 test2025    <- bucket_A %>% filter(Season == 2025)
 
-# No future season to validate n.trees against — reuses fold 2's tree
-# count (train<=2023, valid 2024), the closest backtest fold structurally.
-final_models <- fit_stage_models(final_train, gbm_depth = gbm_depth, gbm_shrink = gbm_shrink,
-                                 gbm_ntrees_fixed = fold_best_iter[2])
-cat("EB k re-estimated on 2021-2024:", final_models$k,
-    " (gbm n.trees reused from fold 2:", fold_best_iter[2], ")\n")
+# Same procedure as each backtest fold, now on all of 2022-2024: the
+# xgboost round count comes from grouped CV inside this training set.
+final_models <- fit_stage_models(final_train)
+cat("EB k re-estimated on 2022-2024:", final_models$k,
+    " elastic net alpha:", final_models$glmnet_alpha,
+    " xgboost depth / min leaf TBF / rounds:", final_models$xgb_params$max_depth, "/",
+    final_models$xgb_params$min_child_weight, "/", final_models$n_rounds, "\n")
 test2025 <- predict_stage_models(final_models, test2025)
+test2025$pred_final <- blend_predict(test2025, blend_w)
 
-cat("\nTop 15 gbm relative influence, Bucket A production model:\n")
-print(head(summary(final_models$fit_gbm, n.trees = final_models$best_iter, plotit = FALSE), 15))
+cat("\nTop 15 xgboost features by share of gain, Bucket A production model:\n")
+imp <- xgb.importance(model = final_models$fit_xgb)
+tree_influence <- data.frame(var = imp$Feature, rel.inf = 100 * imp$Gain / sum(imp$Gain))
+print(head(tree_influence, 15))
 cat("\nTop 15 |glmnet coef|, Bucket A production model:\n")
 gc <- as.matrix(coef(final_models$fit_glmnet, s = "lambda.min"))
 gc <- gc[order(-abs(gc[,1])), , drop = FALSE]
 print(head(gc, 15))
 
-if (use_adaptive_blend) {
-  test2025$tbf_tier <- assign_tbf_tier(test2025$TBF)
-  test2025$pred_final <- NA_real_
-  for (t in 1:3) {
-    idx <- test2025$tbf_tier == t
-    if (any(idx)) test2025$pred_final[idx] <- blend_predict(test2025[idx, ], blend_w_by_tier[[t]])
-  }
-} else {
-  test2025$pred_final <- blend_predict(test2025, blend_w)
-}
+bucket_B1_2025 <- d %>% filter(bucket == "B1_no_history_milb", Season == 2025)
+bucket_B1_2025$pred_final <- predict_milb(fit_milb_final, mm_milb_final, bucket_B1_2025)
 
-bucket_B_2025 <- d %>% filter(bucket == "B_rookie_no_lag", Season == 2025) %>%
+bucket_B2_2025 <- d %>% filter(bucket == "B2_no_history_fallback", Season == 2025) %>%
   mutate(pred_final = league_k_trailing)
 
-# has_batting_record comes from the merged file itself (rebuilt upstream
-# by build_final_merge.R at whatever PA floor was actually pulled), not
-# recomputed from the local hitting CSV above, which can go stale.
-bucket_C_all_2025 <- d %>% filter(bucket == "C_position_player", Season == 2025) %>%
-  mutate(has_milb = !is.na(milb_year))
-
-bucket_C_2025 <- bucket_C_all_2025 %>%
-  mutate(bucket = case_when(
-    has_batting_record             ~ "C1_confirmed_position_player",
-    !has_batting_record & has_milb ~ "C2_milb_translation",
-    TRUE                            ~ "C3_no_record_fallback"
-  ))
-
-c2_rows <- bucket_C_2025 %>% filter(bucket == "C2_milb_translation")
-if (nrow(c2_rows) > 0) {
-  X_c2 <- c2_rows[, milb_feat_cols]
-  for (nm in names(X_c2)) X_c2[[nm]][is.na(X_c2[[nm]])] <- milb_impute_vals[[nm]]
-  c2_rows$pred_milb <- as.numeric(predict(fit_milb_final, newx = as.matrix(X_c2), s = "lambda.min"))
-}
-bucket_C_2025 <- bucket_C_2025 %>%
-  left_join(c2_rows %>% select(PlayerId, Season, pred_milb), by = c("PlayerId", "Season")) %>%
-  mutate(pred_final = case_when(
-    bucket == "C1_confirmed_position_player" ~ pp_k_trailing,
-    bucket == "C2_milb_translation"          ~ pred_milb,
-    TRUE                                       ~ league_k_trailing
-  ))
+bucket_C_2025 <- d %>% filter(bucket == "C_position_player", Season == 2025) %>%
+  mutate(pred_final = pp_k_trailing)
 
 
 # ── Step 11: Combine, Score, and Write Output ────────────────────────────────
 cat("\n=== Step 11: Combining predictions and scoring against real 2025 K% ===\n")
 
-all_2025 <- bind_rows(
-  test2025      %>% select(PlayerId, Name, Season, K_pct, TBF, bucket, pred_final),
-  bucket_B_2025 %>% select(PlayerId, Name, Season, K_pct, TBF, bucket, pred_final),
-  bucket_C_2025 %>% select(PlayerId, Name, Season, K_pct, TBF, bucket, pred_final)
-)
+out_cols <- c("PlayerId", "Name", "Season", "K_pct", "TBF", "bucket", "pred_final")
+all_2025 <- bind_rows(test2025[, out_cols], bucket_B1_2025[, out_cols],
+                      bucket_B2_2025[, out_cols], bucket_C_2025[, out_cols])
+n_2025 <- sum(d$Season == 2025)
+stopifnot(nrow(all_2025) == n_2025, !anyNA(all_2025$pred_final))
 
-# pred_final_raw keeps the pre-correction number; pred_final (corrected,
-# floored at 0) is what's scored and written out from here on.
+# pred_final_raw keeps the pre-calibration number; pred_final (calibrated,
+# clipped to [0, 1]) is what's scored and written out from here on.
 all_2025 <- all_2025 %>%
   mutate(pred_final_raw = pred_final,
-         pred_final = pmax(0, pred_final - bucket_bias[bucket]))
-cat("Effect of bias correction on overall 2025 accuracy:\n")
+         pred_final = pmin(pmax(pred_final * bucket_calib[bucket], 0), 1))
+cat("Effect of calibration on overall 2025 accuracy:\n")
 cat("  RMSE before correction:", round(wrmse(all_2025$pred_final_raw, all_2025$K_pct, all_2025$TBF), 4), "\n")
 cat("  RMSE after  correction:", round(wrmse(all_2025$pred_final, all_2025$K_pct, all_2025$TBF), 4), "\n")
 
-# Prediction intervals: +/- 1.28 * that bucket's own backtested RMSE
-# (approx 80% interval, normal-residual assumption).
-bucket_rmse <- c(
-  A_full_model = bucketA_backtest_rmse,
-  B_rookie_no_lag = bucketB_backtest_rmse,
-  C1_confirmed_position_player = bucketC1_backtest_rmse,
-  C2_milb_translation = milb_c2_backtest_rmse,
-  C3_no_record_fallback = bucketB_backtest_rmse
-)
+# ~80% prediction interval for the observed 2025 K%: model error (from the
+# backtest) plus binomial sampling noise, which shrinks as TBF grows. TBF
+# sets only the interval width for the realized season, never the point
+# prediction.
 all_2025 <- all_2025 %>%
   mutate(
-    interval_halfwidth = bucket_rmse[bucket] * 1.28,
+    interval_halfwidth = interval_z * sqrt(bucket_sigma2[bucket] + pred_final * (1 - pred_final) / TBF),
     pred_lower = pmax(0, pred_final - interval_halfwidth),
-    pred_upper = pred_final + interval_halfwidth
+    pred_upper = pmin(1, pred_final + interval_halfwidth)
   ) %>%
   select(-interval_halfwidth)
 
-cat("\nFINAL 2025 accuracy vs. actual 2025 K%:\n")
-cat("Rows scored:", nrow(all_2025), "of 873\n")
+cat("\nFINAL 2025 accuracy vs. actual 2025 K% (all metrics TBF-weighted):\n")
+cat("Rows scored:", nrow(all_2025), "of", n_2025, "\n")
 cat("Overall  RMSE:", round(wrmse(all_2025$pred_final, all_2025$K_pct, all_2025$TBF), 4),
-    " MAE:", round(wmae(all_2025$pred_final, all_2025$K_pct, all_2025$TBF), 4), "\n")
+    " MAE:", round(wmae(all_2025$pred_final, all_2025$K_pct, all_2025$TBF), 4),
+    " R^2:", round(wr2(all_2025$pred_final, all_2025$K_pct, all_2025$TBF), 3), "\n")
+cat("Binomial log-loss per batter:", round(binom_logloss(all_2025$pred_final, all_2025$K_pct, all_2025$TBF), 4),
+    " (league-average prediction:", round(binom_logloss(d$league_k_trailing[d$Season == 2025][match(all_2025$PlayerId,
+      d$PlayerId[d$Season == 2025])], all_2025$K_pct, all_2025$TBF), 4), ")\n")
+cat("80% interval coverage:", round(mean(all_2025$K_pct >= all_2025$pred_lower &
+                                         all_2025$K_pct <= all_2025$pred_upper), 3), "\n")
 
 by_bucket <- all_2025 %>%
   group_by(bucket) %>%
@@ -655,17 +691,37 @@ by_bucket <- all_2025 %>%
             .groups = "drop")
 print(by_bucket)
 
+cat("\n80% interval coverage by 2025 TBF band:\n")
+all_2025 %>%
+  mutate(tbf_band = cut(TBF, c(0, 25, 117, 269, Inf))) %>%
+  group_by(tbf_band) %>%
+  summarise(n = n(), coverage_80pct = mean(K_pct >= pred_lower & K_pct <= pred_upper), .groups = "drop") %>%
+  print()
+
 cat("\nNoise floor check, 2025 predictions, by bucket:\n")
 for (b in unique(all_2025$bucket)) {
   sub <- all_2025 %>% filter(bucket == b)
   report_noise_floor(sub$pred_final, sub$K_pct, sub$TBF, b)
 }
 
-# Manual C3 cleanup evaluated, not implemented: its ~16 lowest-TBF rows
-# (TBF<25, token mop-up outings) are ~3% of the bucket's weight — even a
-# perfect prediction there moves overall RMSE by ~0.0003. The rest of C3
-# are genuine rookies with no MiLB/batting record, not misclassifications.
-
 write_csv(all_2025, file.path(data_dir, "k_2026_2025_predictions.csv"))
 write_csv(d, file.path(data_dir, "k_2026_features.csv"))
-cat("\n✓ Wrote k_2026_features.csv and k_2026_2025_predictions.csv\n")
+writeLines(capture.output(sessionInfo()), file.path(data_dir, "sessionInfo.txt"))
+
+# Everything the methodology write-up quotes, so its numbers always match this run.
+saveRDS(list(
+  backtest_metrics = metrics,
+  blend_rmse = wrmse(pooled_valid$pred_blend, pooled_valid$K_pct, pooled_valid$TBF),
+  blend_w = blend_w,
+  xgb_params = final_models$xgb_params, xgb_rounds = final_models$n_rounds,
+  glmnet_alpha = final_models$glmnet_alpha,
+  eb_k = final_models$k,
+  backtest_logloss = binom_logloss(pooled_valid$pred_blend, pooled_valid$K_pct, pooled_valid$TBF),
+  milb_backtest = c(n = nrow(bucketB1_hist),
+                    league_rmse = wrmse(bucketB1_hist$league_k_trailing, bucketB1_hist$K_pct, bucketB1_hist$TBF),
+                    milb_rmse = wrmse(bucketB1_hist$pred_rule, bucketB1_hist$K_pct, bucketB1_hist$TBF)),
+  calib_table = calib_table,
+  tree_influence = tree_influence,
+  glmnet_zero = rownames(gc)[gc[, 1] == 0]
+), file.path(data_dir, "k_2026_model_summary.rds"))
+cat("\nWrote k_2026_features.csv, k_2026_2025_predictions.csv, sessionInfo.txt\n")
